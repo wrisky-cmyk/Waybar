@@ -42,6 +42,26 @@ ALabel::ALabel(const Json::Value& config, const std::string& name, const std::st
   }
   label_.get_style_context()->add_class(MODULE_CLASS);
   event_box_.add(label_);
+  if (tooltipEnabled()) {
+    // Keep dynamic tooltip contents out of GtkWidget's tooltip-markup property.
+    // Setting that property queues a display-wide tooltip query, which restarts
+    // GTK's hover delay when modules update faster than the delay can expire.
+    label_.set_has_tooltip(true);
+    label_.signal_query_tooltip().connect(
+        [this](int, int, bool, const Glib::RefPtr<Gtk::Tooltip>& tooltip) {
+          if (!last_tooltip_markup_.has_value() || last_tooltip_markup_->empty()) {
+            active_tooltip_.reset();
+            return false;
+          }
+          active_tooltip_ = tooltip;
+          tooltip->set_markup(*last_tooltip_markup_);
+          return true;
+        });
+    event_box_.signal_leave_notify_event().connect([this](GdkEventCrossing*) {
+      active_tooltip_.reset();
+      return false;
+    });
+  }
   if (config_["max-length"].isUInt()) {
     label_.set_max_width_chars(config_["max-length"].asInt());
     label_.set_ellipsize(Pango::EllipsizeMode::ELLIPSIZE_END);
@@ -123,8 +143,9 @@ ALabel::ALabel(const Json::Value& config, const std::string& name, const std::st
         }
         submenus_[key] = GTK_MENU_ITEM(item);
         menuActionsMap_[key] = it->asString();
-        g_signal_connect(submenus_[key], "activate", G_CALLBACK(handleGtkMenuEvent),
-                         (gpointer)g_strdup(menuActionsMap_[key].c_str()));
+        g_signal_connect_data(submenus_[key], "activate", G_CALLBACK(handleGtkMenuEvent),
+                              g_strdup(menuActionsMap_[key].c_str()), (GClosureNotify)g_free,
+                              (GConnectFlags)0);
       }
       g_object_unref(builder);
     } catch (std::runtime_error& e) {
@@ -147,22 +168,24 @@ ALabel::ALabel(const Json::Value& config, const std::string& name, const std::st
 auto ALabel::update() -> void { AModule::update(); }
 
 bool ALabel::setLabelMarkup(const Glib::ustring& markup) {
-  if (last_label_markup_ == markup) {
+  if (last_label_markup_ == markup.raw()) {
     return false;
   }
 
   label_.set_markup(markup);
-  last_label_markup_ = markup;
+  last_label_markup_ = markup.raw();
   return true;
 }
 
 bool ALabel::setTooltipMarkup(const Glib::ustring& markup) {
-  if (last_tooltip_markup_ == markup) {
+  if (last_tooltip_markup_ == markup.raw()) {
     return false;
   }
 
-  label_.set_tooltip_markup(markup);
-  last_tooltip_markup_ = markup;
+  last_tooltip_markup_ = markup.raw();
+  if (active_tooltip_) {
+    active_tooltip_->set_markup(markup);
+  }
   return true;
 }
 
@@ -183,7 +206,9 @@ std::string ALabel::getIcon(uint16_t percentage, const std::string& alt, uint16_
         if (!threshold.isObject() || !threshold["icon"].isString() || !threshold["max"].isUInt()) {
           static bool warned = false;
           if (!warned) {
-            spdlog::warn("format-icons: skipping invalid threshold object, expected {\"icon\": \"...\", \"max\": N}");
+            spdlog::warn(
+                "format-icons: skipping invalid threshold object, expected {\"icon\": \"...\", "
+                "\"max\": N}");
             warned = true;
           }
           continue;
@@ -229,7 +254,9 @@ std::string ALabel::getIcon(uint16_t percentage, const std::vector<std::string>&
         if (!threshold.isObject() || !threshold["icon"].isString() || !threshold["max"].isUInt()) {
           static bool warned = false;
           if (!warned) {
-            spdlog::warn("format-icons: skipping invalid threshold object, expected {\"icon\": \"...\", \"max\": N}");
+            spdlog::warn(
+                "format-icons: skipping invalid threshold object, expected {\"icon\": \"...\", "
+                "\"max\": N}");
             warned = true;
           }
           continue;

@@ -177,9 +177,6 @@ Mpris::Mpris(const std::string& id, const Json::Value& config)
       thread_.sleep_for(interval_);
     };
   }
-
-  // trigger initial update
-  dp.emit();
 }
 
 Mpris::~Mpris() {
@@ -406,8 +403,11 @@ auto Mpris::onPlayerNameVanished(PlayerctlPlayerManager* manager, PlayerctlPlaye
   if (mpris->player_ == "playerctld") {
     mpris->dp.emit();
   } else if (mpris->player_ == player_name->name) {
+    // Don't touch GTK widgets directly from the playerctl callback: on resume
+    // from suspend this can run in a re-entrant / torn-down state and crash in
+    // Gtk::Widget::set_visible. Only update state + emit; update() (on the main
+    // thread) hides the module when there is no player. See #5124.
     mpris->player = nullptr;
-    mpris->event_box_.set_visible(false);
     mpris->dp.emit();
   }
 }
@@ -488,7 +488,13 @@ auto Mpris::getPlayerInfo() -> std::optional<PlayerInfo> {
         continue;
       }
       auto* tmp = playerctl_player_new_from_name(pn, &error);
-      if (error || !tmp) continue;
+      if (error || !tmp) {
+        // Discard any error from this candidate so it doesn't leak into the next
+        // playerctl_player_new_from_name() call or the post-loop metadata calls, which
+        // assert that the passed GError is NULL (otherwise: GLib-CRITICAL / spurious errorexit).
+        g_clear_error(&error);
+        continue;
+      }
       if (!first_valid_player) {
         first_valid_player = tmp;
         first_valid_name = name;
@@ -537,34 +543,40 @@ auto Mpris::getPlayerInfo() -> std::optional<PlayerInfo> {
       .length = std::nullopt,
   };
 
-  if (auto* artist_ = playerctl_player_get_artist(last_active_player_, &error)) {
-    spdlog::debug("mpris[{}]: artist = {}", info.name, artist_);
-    info.artist = artist_;
-    g_free(artist_);
-  }
-  if (error) goto errorexit;
+  auto sanitize = [ ]( char* raw_str ) {
+      std::string s( raw_str );
+      std::replace( s.begin(), s.end(), '\n', ' ' );
+      std::replace( s.begin(), s.end(), '\r', ' ' );
+      return s;
+    };
 
-  if (auto* album_artist_ =
-          playerctl_player_print_metadata_prop(last_active_player_, "xesam:albumArtist", &error)) {
-    spdlog::debug("mpris[{}]: albumArtist = {}", info.name, album_artist_);
-    info.album_artist = album_artist_;
-    g_free(album_artist_);
+if(auto* artist_ = playerctl_player_get_artist( last_active_player_, &error )) {
+    spdlog::debug( "mpris[{}]: artist = {}", info.name, artist_ );
+    info.artist = sanitize( artist_ );
+    g_free( artist_ );
   }
-  if (error) goto errorexit;
+  if(error) goto errorexit;
 
-  if (auto* album_ = playerctl_player_get_album(last_active_player_, &error)) {
-    spdlog::debug("mpris[{}]: album = {}", info.name, album_);
-    info.album = album_;
-    g_free(album_);
+  if(auto* album_artist_ = playerctl_player_print_metadata_prop( last_active_player_, "xesam:albumArtist", &error )) {
+    spdlog::debug( "mpris[{}]: albumArtist = {}", info.name, album_artist_ );
+    info.album_artist = sanitize( album_artist_ );
+    g_free( album_artist_ );
   }
-  if (error) goto errorexit;
+  if(error) goto errorexit;
 
-  if (auto* title_ = playerctl_player_get_title(last_active_player_, &error)) {
-    spdlog::debug("mpris[{}]: title = {}", info.name, title_);
-    info.title = title_;
-    g_free(title_);
+  if(auto* album_ = playerctl_player_get_album( last_active_player_, &error )) {
+    spdlog::debug( "mpris[{}]: album = {}", info.name, album_ );
+    info.album = sanitize( album_ );
+    g_free( album_ );
   }
-  if (error) goto errorexit;
+  if(error) goto errorexit;
+
+  if(auto* title_ = playerctl_player_get_title( last_active_player_, &error )) {
+    spdlog::debug( "mpris[{}]: title = {}", info.name, title_ );
+    info.title = sanitize( title_ );
+    g_free( title_ );
+  }
+  if(error) goto errorexit;
 
   if (auto* length_ =
           playerctl_player_print_metadata_prop(last_active_player_, "mpris:length", &error)) {

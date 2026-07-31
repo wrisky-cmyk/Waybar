@@ -278,33 +278,26 @@ void Task::hide_if_duplicate() {
   // Squashes if the app is in the squash list and more than 1 instance is open
   if (contains_app && (tbar_->task_id_count(app_id_) > 1 || tbar_->task_title_count(title_) > 1)) {
     squashed_ = true;
-    if (button_visible_) {
-      auto output = gdk_wayland_monitor_get_wl_output(bar_.output->monitor->gobj());
-      handle_output_leave(output);
-    }
+    hide_button();
   }
 
-  if (!squashed_ && !ignored_) {
-    auto output = gdk_wayland_monitor_get_wl_output(bar_.output->monitor->gobj());
-    handle_output_enter(output);
+  if (!squashed_ && !ignored_ && (tbar_->all_outputs() || on_bar_output_)) {
+    show_button();
   }
 }
 
 void Task::hide_if_ignored() {
   if (tbar_->ignore_list().count(app_id_) || tbar_->ignore_list().count(title_)) {
     ignored_ = true;
-    if (button_visible_) {
-      auto output = gdk_wayland_monitor_get_wl_output(bar_.output->monitor->gobj());
-      handle_output_leave(output);
-    }
+    hide_button();
+    return;
   }
 
-  if (!ignored_ && !squashed_) {
-    bool is_was_ignored = ignored_;
+  if (ignored_) {
+    /* The app_id/title changed to a value that is no longer ignored */
     ignored_ = false;
-    if (is_was_ignored) {
-      auto output = gdk_wayland_monitor_get_wl_output(bar_.output->monitor->gobj());
-      handle_output_enter(output);
+    if (!squashed_ && (tbar_->all_outputs() || on_bar_output_)) {
+      show_button();
     }
   }
 }
@@ -353,6 +346,12 @@ void Task::on_button_size_allocated(Gtk::Allocation& alloc) {
 }
 
 void Task::handle_output_enter(struct wl_output* output) {
+  spdlog::debug("{} entered output {}", repr(), (void*)output);
+
+  if (tbar_->show_output(output)) {
+    on_bar_output_ = true;
+  }
+
   if (ignored_) {
     spdlog::debug("{} is ignored", repr());
     return;
@@ -362,33 +361,52 @@ void Task::handle_output_enter(struct wl_output* output) {
     return;
   }
 
-  spdlog::debug("{} entered output {}", repr(), (void*)output);
-
-  if (!button_visible_ && (tbar_->all_outputs() || tbar_->show_output(output))) {
-    /* The task entered the output of the current bar make the button visible */
-    button.signal_size_allocate().connect_notify(
-        sigc::mem_fun(this, &Task::on_button_size_allocated));
-    tbar_->add_button(button);
-    if (!config_["active-only"].asBool() || active()) {
-      button.show();
-    }
-    button_visible_ = true;
-    spdlog::debug("{} now visible on {}", repr(), bar_.output->name);
-    tbar_->update_bar_css_classes();
+  if (tbar_->all_outputs() || on_bar_output_) {
+    /* The task entered the output of the current bar, make the button visible */
+    show_button();
   }
 }
 
 void Task::handle_output_leave(struct wl_output* output) {
   spdlog::debug("{} left output {}", repr(), (void*)output);
 
-  if (button_visible_ && !tbar_->all_outputs() && tbar_->show_output(output)) {
-    /* The task left the output of the current bar, make the button invisible */
-    tbar_->remove_button(button);
-    button.hide();
-    button_visible_ = false;
-    spdlog::debug("{} now invisible on {}", repr(), bar_.output->name);
-    tbar_->update_bar_css_classes();
+  if (tbar_->show_output(output)) {
+    on_bar_output_ = false;
   }
+
+  if (!tbar_->all_outputs() && !on_bar_output_) {
+    /* The task left the output of the current bar, make the button invisible */
+    hide_button();
+  }
+}
+
+void Task::show_button() {
+  if (button_visible_) {
+    return;
+  }
+  if (!size_allocate_connected_) {
+    button.signal_size_allocate().connect_notify(
+        sigc::mem_fun(this, &Task::on_button_size_allocated));
+    size_allocate_connected_ = true;
+  }
+  tbar_->add_button(button);
+  if (!config_["active-only"].asBool() || active()) {
+    button.show();
+  }
+  button_visible_ = true;
+  spdlog::debug("{} now visible on {}", repr(), bar_.output->name);
+  tbar_->update_bar_css_classes();
+}
+
+void Task::hide_button() {
+  if (!button_visible_) {
+    return;
+  }
+  tbar_->remove_button(button);
+  button.hide();
+  button_visible_ = false;
+  spdlog::debug("{} now invisible on {}", repr(), bar_.output->name);
+  tbar_->update_bar_css_classes();
 }
 
 void Task::handle_state(struct wl_array* state) {
@@ -474,9 +492,9 @@ void Task::handle_closed() {
     if (it != tasks.end() && !(*it).ignored_) {
       Task& task = *it;
       task.squashed_ = false;
-      tbar_->add_button(task.button);
-      task.button.show();
-      task.button_visible_ = true;
+      if (tbar_->all_outputs() || task.on_bar_output_) {
+        task.show_button();
+      }
     }
   }
 
@@ -695,6 +713,21 @@ Taskbar::Taskbar(const std::string& id, const waybar::Bar& bar, const Json::Valu
   box_.get_style_context()->add_class(MODULE_CLASS);
   box_.get_style_context()->add_class("empty");
   event_box_.add(box_);
+
+  // wlr/taskbar interprets on-click* config values as built-in actions, handled
+  // per-task in Task::handle_clicked. Register the recognized action names so
+  // AModule dispatches them via doAction() instead of also running them as shell
+  // commands (issue #3284). Values that are not built-in actions are left alone
+  // and still run as user shell commands.
+  const auto is_builtin_action = [](const std::string& v) {
+    return v == "activate" || v == "minimize" || v == "minimize-raise" || v == "maximize" ||
+           v == "fullscreen" || v == "close";
+  };
+  for (const auto* event : {"on-click", "on-click-middle", "on-click-right"}) {
+    if (config_[event].isString() && is_builtin_action(config_[event].asString())) {
+      eventActionMap_.insert({event, config_[event].asString()});
+    }
+  }
 
   // Make task buttons distribute evenly across the available width.
   if (config_["homogeneous"].isBool() && config_["homogeneous"].asBool()) {

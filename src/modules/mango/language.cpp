@@ -17,7 +17,6 @@ Language::Language(const std::string& id, const Bar& bar, const Json::Value& con
 
   IPC::getInstance().registerForIPC("monitor", this);
   updateFromIPC();
-  dp.emit();
 }
 
 Language::~Language() {
@@ -109,8 +108,6 @@ Language::Layout Language::getLayout(const std::string& fullName) {
         if (short_description.empty()) {
           short_description = short_name;
         }
-
-        short_description = short_name;
 
         Layout info{desc, short_name, variant, short_description};
         return info;

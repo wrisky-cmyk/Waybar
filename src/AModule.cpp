@@ -118,7 +118,7 @@ auto AModule::update() -> void {
   if (config_["on-update"].isString()) {
     pid_children_.push_back(util::command::forkExec(config_["on-update"].asString()));
   }
-  signal_updated.emit(this); 
+  signal_updated.emit(this);
 }
 // Get mapping between event name and module action name
 // Then call overridden doAction in order to call appropriate module action
@@ -222,17 +222,39 @@ bool AModule::handleUserEvent(GdkEventButton* const& e) {
   }
   // Second call user scripts
   if (!format.empty()) {
-    if (config_[format].isString())
-      format = config_[format].asString();
-    else
+    // If the configured value for this event is a recognized built-in module
+    // action (registered in eventActionMap_), it has already been dispatched
+    // via doAction() above / handled by the module itself. Don't additionally
+    // run it as a shell command (issue #3284). Any other value is still treated
+    // as a user shell command.
+    const auto actionIt = eventActionMap_.find(format);
+    const bool isModuleAction = actionIt != eventActionMap_.cend() && config_[format].isString() &&
+                                config_[format].asString() == actionIt->second;
+    if (isModuleAction || !config_[format].isString())
       format.clear();
+    else
+      format = config_[format].asString();
   }
   if (!format.empty()) {
     const int width = gdk_window_get_width(e->window);
     const int height = gdk_window_get_height(e->window);
-    const std::string cmd =
-        fmt::format(fmt::runtime(format), fmt::arg("x", (int)round(100. * e->x / width)),
-                    fmt::arg("y", (int)round(100. * e->y / height)));
+    // Substitute {x}/{y} with the click position. The configured command is
+    // arbitrary user input that may contain literal braces which are not {x}/{y}
+    // (e.g. `echo ${HOME}`, `awk '{print $1}'`, brace expansions). Those make
+    // libfmt throw fmt::format_error; since we run inside a GTK signal handler an
+    // uncaught exception aborts the whole bar. Only format when a placeholder is
+    // actually present, and fall back to the raw command if formatting throws.
+    std::string cmd = format;
+    if (format.find("{x}") != std::string::npos || format.find("{y}") != std::string::npos) {
+      try {
+        cmd = fmt::format(fmt::runtime(format), fmt::arg("x", (int)round(100. * e->x / width)),
+                          fmt::arg("y", (int)round(100. * e->y / height)));
+      } catch (const fmt::format_error& err) {
+        spdlog::warn("Failed to format command '{}': {}. Running it unformatted.", format,
+                     err.what());
+        cmd = format;
+      }
+    }
     pid_children_.push_back(util::command::forkExec(cmd));
   }
   dp.emit();

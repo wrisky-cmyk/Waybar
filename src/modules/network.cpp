@@ -8,6 +8,7 @@
 
 #include <cassert>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <optional>
 #include <sstream>
@@ -89,13 +90,16 @@ uint32_t waybar::modules::Network::readLinkSpeed() const {
 
   if (!sysfs_speed) return 0;
 
-  uint32_t speed;
+  // Read into a signed type: /sys/class/net/<if>/speed reports -1 when there is
+  // no carrier. Extracting -1 into an unsigned type would wrap to a huge value
+  // (and would not set failbit), so use a signed type and validate the result.
+  int64_t speed = 0;
   sysfs_speed >> speed;
 
-  if (sysfs_speed.bad())  // read fails on incompatible devices
+  if (sysfs_speed.fail() || speed < 0)  // read fails on incompatible devices
     return 0;
 
-  return speed;
+  return static_cast<uint32_t>(speed);
 }
 
 waybar::modules::Network::Network(const std::string& id, const Json::Value& config)
@@ -136,7 +140,6 @@ waybar::modules::Network::Network(const std::string& id, const Json::Value& conf
   createEventSocket();
   createInfoSocket();
 
-  dp.emit();
   // Ask for a dump of interfaces and then addresses to populate our
   // information. First the interface dump, and once done, the callback
   // will be called again which will ask for addresses dump.
@@ -179,6 +182,12 @@ void waybar::modules::Network::createEventSocket() {
   if (nl_socket_set_nonblocking(ev_sock_)) {
     throw std::runtime_error("Can't set non-blocking on network socket");
   }
+  // Enlarge the socket receive buffer so that a burst of link/address/route
+  // change notifications (e.g. a router reboot or a PPPoE redial) is less likely
+  // to overflow it and make the kernel drop messages (ENOBUFS). Overruns are
+  // still handled in worker() by resynchronising the state, but a larger buffer
+  // avoids most of them. The kernel caps the request at net.core.rmem_max.
+  nl_socket_set_buffer_size(ev_sock_, 1024 * 1024, 0);
   nl_socket_add_memberships(ev_sock_, RTNLGRP_LINK, RTNLGRP_IPV4_IFADDR, RTNLGRP_IPV6_IFADDR, 0);
   if (!config_["interface"].isString()) {
     nl_socket_add_memberships(ev_sock_, RTNLGRP_IPV4_ROUTE, RTNLGRP_IPV6_ROUTE, 0);
@@ -273,6 +282,27 @@ void waybar::modules::Network::worker() {
               rc = 0;
               break;
             }
+            if (rc == -NLE_NOMEM || errno == ENOBUFS) {
+              // The kernel dropped multicast notifications because our receive
+              // buffer overflowed. This happens during a burst of
+              // link/address/route changes such as a router reboot or a PPPoE
+              // redial. We have lost track of the current state -- in
+              // particular the RTM_NEWADDR carrying the interface's new IP
+              // address may have been dropped -- so request a fresh dump to
+              // resynchronise. Without this the address (cleared by the
+              // preceding RTM_DELADDR) would stay blank until Waybar is
+              // restarted, because nothing else re-queries it (#5122).
+              spdlog::warn("network: netlink receive buffer overrun, resyncing state");
+              want_link_dump_ = true;
+              want_addr_dump_ = true;
+              if (!config_["interface"].isString()) {
+                want_route_dump_ = true;
+              }
+              askForStateDump();
+              // Keep draining; the next recv proceeds normally now that the
+              // overrun has been reported.
+              continue;
+            }
           }
           if (rc < 0) {
             spdlog::error("nl_recvmsgs_default error: {}", nl_geterror(-rc));
@@ -288,6 +318,19 @@ void waybar::modules::Network::worker() {
   };
 }
 
+bool waybar::modules::Network::isWireless() const {
+  // The rfkill switch we monitor (and thus the "disabled" state) only applies
+  // to wireless radios. An interface is wireless if the kernel exposes an
+  // 802.11 phy (cfg80211/mac80211) or a legacy "wireless" node for it in sysfs.
+  if (ifname_.empty()) {
+    return false;
+  }
+  const auto base = "/sys/class/net/" + ifname_;
+  std::error_code ec;
+  return std::filesystem::exists(base + "/phy80211", ec) ||
+         std::filesystem::exists(base + "/wireless", ec);
+}
+
 const std::string waybar::modules::Network::getNetworkState() const {
   if (ifid_ == -1 || !carrier_) {
 #ifdef WANT_RFKILL
@@ -295,7 +338,14 @@ const std::string waybar::modules::Network::getNetworkState() const {
     if (config_["rfkill"].isBool()) {
       display_rfkill = config_["rfkill"].asBool();
     }
-    if (rfkill_.getState() && display_rfkill) return "disabled";
+    // The rfkill switch is for wireless (WLAN) radios only, so it must not mask
+    // a wired interface that merely lost its carrier (e.g. an unplugged ethernet
+    // cable): such an interface has to report "disconnected", not "disabled",
+    // otherwise cable-unplug detection breaks on ethernet modules (#4364).
+    // Only honor rfkill when there is no interface or the interface is wireless.
+    if (rfkill_.getState() && display_rfkill && (ifname_.empty() || isWireless())) {
+      return "disabled";
+    }
 #endif
     return "disconnected";
   }
@@ -1016,18 +1066,15 @@ void waybar::modules::Network::parseSignal(struct nlattr** bss) {
   if (bss[NL80211_BSS_SIGNAL_MBM] != nullptr) {
     // signalstrength in dBm from mBm
     signal_strength_dbm_ = nla_get_s32(bss[NL80211_BSS_SIGNAL_MBM]) / 100;
-    // WiFi-hardware usually operates in the range -90 to -30dBm.
 
-    // If a signal is too strong, it can overwhelm receiving circuity that is designed
-    // to pick up and process a certain signal level. The following percentage is scaled to
-    // punish signals that are too strong (>= -45dBm) or too weak (<= -45 dBm).
-    const int hardwareOptimum = -45;
-    const int hardwareMin = -90;
-    const int strength =
-        100 -
-        ((abs(signal_strength_dbm_ - hardwareOptimum) / double{hardwareOptimum - hardwareMin}) *
-         100);
-    signal_strength_ = std::clamp(strength, 0, 100);
+    // uses nmcli implementation for calculating strength
+    // https://github.com/NetworkManager/NetworkManager/blob/23ffa5fc6e7acbd7a96138c6c18f478f5127177d/src/libnm-platform/wifi/nm-wifi-utils-nl80211.c#L411
+
+    const int noise_floor_dbm = -90;
+    const int signal_max_dbm = -20;
+    signal_strength_dbm_ = CLAMP(signal_strength_dbm_, noise_floor_dbm, signal_max_dbm);
+    signal_strength_ = 100 - (70 * (((float)signal_max_dbm - (float)signal_strength_dbm_) /
+                                    ((float)signal_max_dbm - (float)noise_floor_dbm)));
 
     if (signal_strength_dbm_ >= -50) {
       signal_strength_app_ = "Great Connectivity";

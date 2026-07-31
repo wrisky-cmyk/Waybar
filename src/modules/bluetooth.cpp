@@ -213,8 +213,6 @@ waybar::modules::Bluetooth::Bluetooth(const std::string& id, const Json::Value& 
 #ifdef WANT_RFKILL
   rfkill_.on_update.connect(sigc::hide(sigc::mem_fun(*this, &Bluetooth::update)));
 #endif
-
-  dp.emit();
 }
 
 auto waybar::modules::Bluetooth::update() -> void {
@@ -349,7 +347,14 @@ auto waybar::modules::Bluetooth::update() -> void {
               fmt::arg("device_alias", dev.alias), fmt::arg("icon", enumerate_icon),
               fmt::arg("device_battery_percentage", dev.battery_percentage.value_or(0)),
               fmt::arg("device_battery_percentage_peripheral",
-                       dev.battery_percentage_peripheral.value_or(0)));
+                       dev.battery_percentage_peripheral.value_or(0)),
+              // Also accept the module-level placeholders so {status} etc. don't
+              // throw "argument not found" in an enumerate format (#4384).
+              fmt::arg("status", state_), fmt::arg("num_connections", connected_devices_.size()),
+              fmt::arg("controller_address", cur_controller_ ? cur_controller_->address : "null"),
+              fmt::arg("controller_address_type",
+                       cur_controller_ ? cur_controller_->address_type : "null"),
+              fmt::arg("controller_alias", cur_controller_ ? cur_controller_->alias : "null"));
         }
       }
       device_enumerate_ = ss.str();
