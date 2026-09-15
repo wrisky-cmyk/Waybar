@@ -593,6 +593,11 @@ void Item::menuProbeReady(Glib::RefPtr<Gio::AsyncResult>& result, const std::str
   try {
     proxy_->get_connection()->call_finish(result);
     has_dbus_menu_ = true;
+    // Build the menu as soon as the item turns out to export a dbusmenu. Its items are
+    // loaded asynchronously over D-Bus, and the popup is mapped right when it is created:
+    // a menu first built inside handleClick() can therefore be shown empty or clipped,
+    // which shows up as an incomplete context menu on the first right click.
+    makeMenu();
   } catch (const Glib::Error&) {
   }
 }
